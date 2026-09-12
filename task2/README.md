@@ -13,5 +13,5 @@
 | [`bidding-service.md`](./bidding-service.md) | Границы сервиса, внешний и внутренний API, зависимости, модель данных, паттерны надёжности |
 | [`interaction.md`](./interaction.md) | Выбор протоколов (gRPC / REST / Kafka) с обоснованием, дизайн событийных потоков, идемпотентность |
 | [`api-gateway.md`](./api-gateway.md) | Дизайн API Gateway для DSP-интеграции: маршрутизация, rate limiting, аутентификация, Circuit Breaker, мониторинг |
-| [`diagrams/sequence-bid-request.puml`](./diagrams/sequence-bid-request.puml) | Sequence-диаграмма: обработка bid-запроса, включая сценарий отказа зависимости и fallback |
-| [`diagrams/component-bidding-service.puml`](./diagrams/component-bidding-service.puml) | Component-диаграмма: внутреннее устройство Сервиса ставок |
+| [`Diagrams/sequence-bid-request.puml`](./diagrams/sequence-bid-request.puml) | Sequence-диаграмма: обработка bid-запроса, включая сценарий отказа зависимости и fallback |
+| [`Diagrams/component-bidding-service.puml`](./diagrams/component-bidding-service.puml) | Component-диаграмма: внутреннее устройство Сервиса ставок |
