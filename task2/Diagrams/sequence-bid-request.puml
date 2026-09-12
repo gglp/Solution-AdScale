@@ -1,0 +1,69 @@
+@startuml
+title Sequence — обработка bid-запроса (happy path + fallback при отказе Кеша)
+
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 160
+
+actor "DSP-партнёр" as DSP
+participant "API Gateway" as GW
+participant "Сервис ставок" as Bidding
+participant "Кеш (Redis)" as Cache
+participant "Сервис выдачи" as Delivery
+participant "Сервис статистики" as Stats
+queue "Очередь событий (Kafka)" as Kafka
+
+== Синхронный путь (бюджет P95 ≤ 80 мс) ==
+
+DSP -> GW: POST /rtb/bid (OpenRTB BidRequest)
+activate GW
+
+GW -> GW: аутентификация (mTLS), rate limit (token bucket)
+GW -> GW: Circuit Breaker: цепь к Сервису ставок закрыта — продолжаем
+
+GW -> Bidding: EvaluateBid(BidContext) [gRPC]
+activate Bidding
+
+alt Кеш доступен (основной путь)
+    Bidding -> Cache: GET targeting_index:{geo}:{device}
+    activate Cache
+    Cache --> Bidding: campaign_id[] (кандидаты)
+    Bidding -> Cache: GET campaign:{id}, budget_remaining:{id}
+    Cache --> Bidding: конфигурация кампаний, остаток бюджета
+    deactivate Cache
+    Bidding -> Bidding: взвешивание ставок, выбор победителя
+
+    Bidding -> Delivery: RenderCreative(campaign_id) [gRPC]
+    activate Delivery
+    Delivery --> Bidding: creative markup (adm)
+    deactivate Delivery
+
+else Кеш недоступен / Circuit Breaker открыт
+    Bidding -> Cache: GET targeting_index:{geo}:{device}
+    activate Cache
+    Cache --> Bidding: timeout / error
+    deactivate Cache
+    Bidding -> Bidding: Circuit Breaker → open,\nfallback: последняя валидная\nставка из локального snapshot\nили дефолтная консервативная ставка
+end
+
+Bidding --> GW: BidDecision (has_bid, price, creative_ref)
+deactivate Bidding
+
+GW --> DSP: 200 OK (OpenRTB BidResponse)\nили 204 No Content
+deactivate GW
+
+== Асинхронный путь (вне бюджета SLA, не блокирует ответ DSP-партнёру) ==
+
+Delivery ->> Stats: событие показа (async, fire-and-forget)
+activate Stats
+Stats ->> Kafka: publish ad.impressions {event_id, campaign_id, ...}
+deactivate Stats
+
+Kafka -->> Kafka: доставка независимым consumer-группам\n(Сервис аналитики, Финансовый сервис,\nХранилище событий)
+
+note over Kafka
+  Идемпотентность: Финансовый сервис
+  дедуплицирует по event_id перед
+  списанием средств (см. interaction.md)
+end note
+
+@enduml
