@@ -1,0 +1,116 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+LAYOUT_LEFT_RIGHT()
+
+title C4 Container Diagram — AdScale (TO-BE, горизонт — год)
+
+' ====================== Акторы ======================
+Person(advertiser, "Рекламодатель", "Управляет кампаниями, бюджетами и ставками через личный кабинет")
+Person_Ext(endUser, "Пользователь сайта/приложения", "Просматривает рекламу, кликает по баннерам")
+
+System_Ext(dspPartner, "DSP-партнёр", "Отправляют bid-запросы, получают ответы по OpenRTB (текущий и новые партнёры)")
+System_Ext(paymentGateway, "Платёжный шлюз", "Обработка пополнения рекламных бюджетов")
+
+' ====================== Целевая архитектура AdScale ======================
+System_Boundary(adscale, "AdScale (целевая архитектура)") {
+
+    Container(apiGateway, "API Gateway", "Managed API Gateway", "Единая точка входа для всего внешнего трафика: DSP-партнёры, рекламодатели, пользователи; маршрутизация, аутентификация, rate limiting")
+
+    Container(biddingService, "Сервис ставок", "C++ / Go", "Приём bid-запроса, подбор кандидатов, взвешивание ставок, определение победителя (P95 ≤ 80 мс)")
+    ContainerDb(campaignStore, "Хранилище кампаний", "PostgreSQL", "Конфигурация кампаний и ставок")
+    ContainerDb(cache, "Кеш", "Redis (in-memory)", "Горячие данные для взвешивания ставок")
+
+    Container(deliveryService, "Сервис выдачи", "Node.js", "Формирует HTML/JS-разметку баннера и HTTP response (stateless)")
+
+    Container(statsService, "Сервис статистики", "Python", "Приём и буферизованная запись событий кликов/показов")
+    Container(eventBroker, "Очередь событий", "Kafka", "Асинхронная событийная шина: клики, показы")
+    ContainerDb(eventsStore, "Хранилище событий", "Собственное хранилище событий", "События показов и кликов")
+
+    Container(analyticsService, "Сервис аналитики", "Python", "Тяжёлые аналитические запросы и отчётность")
+    ContainerDb(dwh, "Аналитическое хранилище (DWH)", "Аналитическое хранилище", "Данные для отчётности рекламодателям")
+
+    Container(financialService, "Финансовый сервис", "Go", "Списание средств, выставление счетов, сведение балансов")
+    ContainerDb(financialDb, "Финансовая БД", "PostgreSQL (изолированная)", "Транзакционные финансовые данные")
+
+    Container(adCabinet, "Рекламный кабинет (BFF)", "Node.js + JavaScript", "Web UI и API: управление кампаниями, отчётность, баланс")
+}
+
+' ====================== Связи: внешние ======================
+Rel_U(dspPartner, apiGateway, "Bid-запросы / ответы", "HTTPS / OpenRTB")
+Rel(apiGateway, biddingService, "Маршрутизация bid-запроса", "Internal / gRPC")
+Rel_U(endUser, apiGateway, "Просмотр рекламы и клики", "HTTPS")
+Rel(apiGateway, deliveryService, "Маршрутизация запроса на показ рекламы", "Internal / gRPC")
+Rel(advertiser, apiGateway, "Управляет кампаниями и бюджетами", "HTTPS")
+Rel(apiGateway, adCabinet, "Маршрутизация запроса рекламодателя", "Internal / gRPC")
+Rel(adCabinet, paymentGateway, "Пополнение бюджета", "HTTPS / REST")
+
+' ====================== Связи: критичный контур ======================
+Rel(biddingService, cache, "Читает горячие данные для взвешивания ставок", "In-memory")
+Rel(cache, campaignStore, "Синхронизация конфигурации кампаний", "Async refresh")
+Rel(biddingService, deliveryService, "Передаёт победителя аукциона", "Internal Call")
+
+' ====================== Связи: статистика/аналитика ======================
+Rel(deliveryService, statsService, "Регистрирует показы/клики", "Async")
+Rel(statsService, eventBroker, "Публикует события", "Produce")
+Rel(eventBroker, eventsStore, "Буферизованная запись", "Consume")
+Rel(eventBroker, analyticsService, "Потоковая обработка событий", "Consume")
+Rel(eventBroker, financialService, "События показов/кликов для расчёта списаний", "Consume")
+Rel(analyticsService, dwh, "Запись агрегатов и отчётов", "Write")
+
+' ====================== Связи: финансы и кабинет ======================
+Rel(adCabinet, financialService, "Операции с балансом и счетами", "Internal API")
+Rel(financialService, financialDb, "Транзакции и балансы", "JDBC")
+Rel(adCabinet, analyticsService, "Запросы отчётности", "Internal API")
+Rel(adCabinet, campaignStore, "Управление конфигурацией кампаний", "Internal API")
+
+' ====================== Layout hints ======================
+Lay_D(apiGateway, biddingService)
+Lay_D(biddingService, deliveryService)
+Lay_D(deliveryService, statsService)
+Lay_R(statsService, eventBroker)
+Lay_R(eventBroker, analyticsService)
+Lay_D(biddingService, cache)
+Lay_D(cache, campaignStore)
+Lay_R(analyticsService, financialService)
+Lay_R(financialService, adCabinet)
+Lay_D(financialService, financialDb)
+Lay_D(analyticsService, dwh)
+Lay_D(eventBroker, eventsStore)
+
+' ====================== Аннотации ======================
+note right of biddingService
+  **Первый сервис в декомпозиции**
+  Выделен по ADR-002:
+  самый критичный по SLA
+  и наиболее нагруженный узел
+end note
+
+note right of cache
+  Устраняет синхронную
+  зависимость Сервиса ставок
+  от базы данных в hot path
+end note
+
+note right of eventBroker
+  Технология выбрана в
+  ADR-003 (потоковая обработка)
+end note
+
+note bottom of financialDb
+  Изолирована от аналитической
+  и статистической нагрузки —
+  собственная БД на сервис
+end note
+
+' ====================== Легенда с метриками ======================
+legend right
+  <#00AA00> **До 50 000 RPS** на целевом этапе
+  <#00AA00> **P95 ≤ 80 мс** (SLA DSP-партнёра)
+  <#00AA00> **Доступность (SLA) ≥ 99,9%**
+  <#888888> Каждый сервис — со своей БД
+  <#888888> Горизонтальное автомасштабирование
+  <#888888> Мультирегиональное развёртывание
+endlegend
+@enduml
