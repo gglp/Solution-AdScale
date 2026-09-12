@@ -1,0 +1,65 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Диаграмма владения данными — AdScale (Database per Service)
+
+Container(bidding, "Сервис ставок", "C++ / Go", "Приём bid-запроса, взвешивание ставок")
+ContainerDb(redisCluster, "Redis Cluster", "Redis (in-memory)", "Кампании, таргетинг-индекс, остатки бюджета — read-модель")
+
+Container(campaign, "Сервис кампаний", "Node.js", "Управление кампаниями, таргетингом, бюджетами")
+ContainerDb(campaignDb, "PostgreSQL (Campaign DB)", "PostgreSQL", "Источник истины по конфигурации кампаний")
+
+Container(stats, "Сервис статистики", "Python", "Приём событий показов/кликов")
+ContainerDb(cassandra, "Cassandra", "Wide-column", "Журнал событий показов/кликов")
+
+Container(analytics, "Сервис аналитики", "Python", "Агрегация и отчётность")
+ContainerDb(clickhouse, "ClickHouse", "Колоночная OLAP", "Агрегаты для отчётности рекламодателям")
+
+Container(financial, "Сервис финансов", "Go", "Списание средств, счета, балансы")
+ContainerDb(financialDb, "PostgreSQL (Financial DB)", "PostgreSQL", "Транзакционные финансовые данные")
+
+Container(kafka, "Kafka", "Брокер событий", "ad.impressions, ad.clicks, campaign.updated, campaign.budget.updated, campaign.activated")
+
+Rel(bidding, redisCluster, "Читает/декрементирует бюджет", "Redis protocol")
+Rel(campaign, campaignDb, "CRUD кампаний", "SQL")
+Rel(campaign, kafka, "Публикует campaign.updated,\ncampaign.budget.updated,\ncampaign.activated")
+Rel(kafka, bidding, "Cache-updater потребляет\ncampaign.* и пишет в Redis")
+
+Rel(stats, cassandra, "Записывает сырые события", "CQL")
+Rel(stats, kafka, "Публикует ad.impressions, ad.clicks")
+Rel(kafka, analytics, "Потребляет ad.impressions, ad.clicks")
+Rel(analytics, clickhouse, "Пишет агрегаты", "Write")
+Rel(kafka, financial, "Потребляет ad.impressions, ad.clicks\n(основание для списаний)")
+Rel(financial, financialDb, "Транзакции и балансы", "SQL")
+
+note right of campaignDb
+  Master-Slave: 1 primary +
+  read-реплики для чтения
+  и failover
+end note
+
+note right of financialDb
+  Master-Slave: синхронная
+  реплика, RPO = 0
+end note
+
+note right of cassandra
+  Masterless, RF = 3,
+  шард-ключ (campaign_id, date_bucket)
+end note
+
+note right of clickhouse
+  Шардирование по hash(campaign_id),
+  партиционирование по дате,
+  read-реплики для отчётности
+end note
+
+note left of redisCluster
+  Redis Cluster: хеш-слоты,
+  TTL как страховка +
+  активная инвалидация по событиям
+end note
+
+@enduml
