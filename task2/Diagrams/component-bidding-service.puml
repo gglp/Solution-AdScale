@@ -1,0 +1,37 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+LAYOUT_WITH_LEGEND()
+
+title C4 Component Diagram — внутреннее устройство Сервиса ставок
+
+Container_Ext(gateway, "API Gateway", "Managed API Gateway", "Маршрутизирует bid-запросы")
+
+Container_Boundary(bidding, "Сервис ставок") {
+    Component(apiLayer, "API Layer", "gRPC server", "Принимает EvaluateBid, валидирует BidContext, применяет дедлайн запроса")
+    Component(candidateSelector, "Candidate Selector", "модуль", "Отбирает кандидатов среди кампаний по условиям таргетинга")
+    Component(auctionLogic, "Auction Logic", "модуль", "Взвешивает ставки кандидатов по бизнес-правилам, выбирает победителя")
+    Component(cacheClient, "Cache Client", "модуль", "Redis-клиент; оборачивает вызовы Circuit Breaker'ом")
+    Component(deliveryClient, "Delivery Client", "модуль", "gRPC-клиент к Сервису выдачи; оборачивает вызовы Circuit Breaker'ом")
+    Component(fallbackStore, "Fallback Snapshot", "in-memory", "Последний валидный локальный снимок ставок и дефолтные консервативные ставки на случай отказа Кеша")
+    Component(syncWorker, "Campaign Sync Worker", "фоновый процесс", "Периодически обновляет Кеш из Хранилища кампаний (async refresh)")
+}
+
+ContainerDb_Ext(cache, "Кеш", "Redis (in-memory)", "Горячие данные для взвешивания ставок")
+ContainerDb_Ext(campaignStore, "Хранилище кампаний", "PostgreSQL", "Источник истины по конфигурации кампаний")
+Container_Ext(delivery, "Сервис выдачи", "Node.js", "Формирует HTML/JS-разметку баннера")
+
+Rel(gateway, apiLayer, "EvaluateBid(BidContext)", "gRPC")
+Rel(apiLayer, candidateSelector, "передаёт контекст показа")
+Rel(candidateSelector, cacheClient, "запрашивает targeting_index, campaign:{id}")
+Rel(cacheClient, cache, "GET", "Redis protocol")
+Rel(cacheClient, fallbackStore, "при отказе Кеша — читает снимок")
+Rel(candidateSelector, auctionLogic, "передаёт список кандидатов")
+Rel(auctionLogic, deliveryClient, "запрашивает разметку для победителя")
+Rel(deliveryClient, delivery, "RenderCreative(campaign_id)", "gRPC")
+Rel(auctionLogic, apiLayer, "возвращает BidDecision")
+Rel(syncWorker, campaignStore, "читает конфигурацию кампаний", "SQL, не в hot path")
+Rel(syncWorker, cache, "обновляет campaign:{id}, targeting_index", "async refresh")
+Rel(syncWorker, fallbackStore, "обновляет локальный снимок")
+
+@enduml
