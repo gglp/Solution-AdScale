@@ -1,0 +1,75 @@
+@startuml
+title Sequence — инвалидация и прогрев кэша Сервиса ставок
+
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 160
+
+actor "Рекламодатель" as Advertiser
+participant "Сервис кампаний" as Campaign
+database "PostgreSQL\n(Campaign DB)" as CampaignDb
+queue "Kafka\n(campaign.updated /\ncampaign.budget.updated /\ncampaign.activated)" as Kafka
+participant "Cache-updater\n(Сервис ставок)" as Updater
+database "Redis Cluster" as Redis
+participant "Сервис ставок\n(hot path)" as Bidding
+
+== Активная инвалидация при изменении кампании ==
+
+Advertiser -> Campaign: обновить бюджет / таргетинг кампании
+activate Campaign
+Campaign -> CampaignDb: UPDATE campaigns SET ... (транзакция)
+activate CampaignDb
+CampaignDb --> Campaign: OK
+deactivate CampaignDb
+Campaign ->> Kafka: publish campaign.budget.updated\n{campaign_id, ...} (compacted topic)
+Campaign --> Advertiser: 200 OK
+deactivate Campaign
+
+Kafka -->> Updater: consume campaign.budget.updated
+activate Updater
+Updater -> Redis: SET campaign:{id}, budget_remaining:{id}
+activate Redis
+Redis --> Updater: OK
+deactivate Redis
+deactivate Updater
+
+note over Bidding, Redis
+  Hot path Сервиса ставок читает уже
+  обновлённое значение — без синхронного
+  похода в Сервис кампаний
+end note
+
+== Прогрев при активации новой кампании ==
+
+Campaign ->> Kafka: publish campaign.activated {campaign_id, targeting_rules}
+Kafka -->> Updater: consume campaign.activated
+activate Updater
+Updater -> Redis: SET campaign:{id}\nSADD targeting_index:{geo}:{device} campaign_id
+activate Redis
+Redis --> Updater: OK
+deactivate Redis
+deactivate Updater
+
+note over Updater, Redis
+  Прогрев выполняется ДО первого
+  bid-запроса, подходящего кампании —
+  реактивного cache miss не возникает
+end note
+
+== Прогрев при старте нового инстанса Сервиса ставок ==
+
+Bidding -> Campaign: GET /campaigns/active (полная выгрузка активных кампаний)
+activate Campaign
+Campaign --> Bidding: список активных кампаний и таргетинга
+deactivate Campaign
+Bidding -> Redis: массовая загрузка campaign:*, targeting_index:*
+activate Redis
+Redis --> Bidding: OK
+deactivate Redis
+
+note over Bidding
+  Readiness probe становится "ready"
+  только после завершения прогрева —
+  инстанс не получает трафик с холодным кэшем
+end note
+
+@enduml
