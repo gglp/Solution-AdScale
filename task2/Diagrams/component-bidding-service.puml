@@ -14,11 +14,13 @@ Container_Boundary(bidding, "Сервис ставок") {
     Component(cacheClient, "Cache Client", "модуль", "Redis-клиент; оборачивает вызовы Circuit Breaker'ом")
     Component(deliveryClient, "Delivery Client", "модуль", "gRPC-клиент к Сервису выдачи; оборачивает вызовы Circuit Breaker'ом")
     Component(fallbackStore, "Fallback Snapshot", "in-memory", "Последний валидный локальный снимок ставок и дефолтные консервативные ставки на случай отказа Кеша")
-    Component(syncWorker, "Campaign Sync Worker", "фоновый процесс", "Периодически обновляет Кеш из Хранилища кампаний (async refresh)")
+    Component(campaignClient, "Campaign Client", "gRPC-клиент", "Bulk-запрос GetActiveCampaigns при старте инстанса")
+    Component(cacheUpdater, "Cache Updater", "Kafka consumer", "Потребляет campaign.updated / campaign.budget.updated / campaign.activated, обновляет Кеш")
 }
 
-ContainerDb_Ext(cache, "Кеш", "Redis (in-memory)", "Горячие данные для взвешивания ставок")
-ContainerDb_Ext(campaignStore, "Хранилище кампаний", "PostgreSQL", "Источник истины по конфигурации кампаний")
+ContainerDb_Ext(cache, "Кеш", "Redis Cluster", "Горячие данные для взвешивания ставок")
+Container_Ext(campaignService, "Сервис кампаний", "gRPC-сервис", "Источник истины по конфигурации кампаний и бюджетам")
+Container_Ext(kafka, "Kafka", "Брокер событий", "campaign.updated / campaign.budget.updated / campaign.activated")
 Container_Ext(delivery, "Сервис выдачи", "Node.js", "Формирует HTML/JS-разметку баннера")
 
 Rel(gateway, apiLayer, "EvaluateBid(BidContext)", "gRPC")
@@ -30,8 +32,14 @@ Rel(candidateSelector, auctionLogic, "передаёт список кандид
 Rel(auctionLogic, deliveryClient, "запрашивает разметку для победителя")
 Rel(deliveryClient, delivery, "RenderCreative(campaign_id)", "gRPC")
 Rel(auctionLogic, apiLayer, "возвращает BidDecision")
-Rel(syncWorker, campaignStore, "читает конфигурацию кампаний", "SQL, не в hot path")
-Rel(syncWorker, cache, "обновляет campaign:{id}, targeting_index", "async refresh")
-Rel(syncWorker, fallbackStore, "обновляет локальный снимок")
+
+Rel(campaignClient, campaignService, "GetActiveCampaigns(...)", "gRPC, только при старте инстанса")
+Rel(campaignClient, cache, "первичная (bulk) загрузка campaign:{id}, targeting_index")
+Rel(campaignClient, fallbackStore, "инициализирует локальный снимок")
+
+Rel(campaignService, kafka, "публикует campaign.updated / campaign.budget.updated / campaign.activated")
+Rel(kafka, cacheUpdater, "потребляет события", "Kafka consumer")
+Rel(cacheUpdater, cache, "инкрементально обновляет campaign:{id}, targeting_index, budget_remaining")
+Rel(cacheUpdater, fallbackStore, "обновляет локальный снимок")
 
 @enduml
