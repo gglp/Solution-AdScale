@@ -1,69 +1,45 @@
 @startuml
-title Sequence — обработка bid-запроса (happy path + fallback при отказе Кеша)
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
 
-skinparam sequenceMessageAlign center
-skinparam maxMessageSize 160
+LAYOUT_WITH_LEGEND()
 
-actor "DSP-партнёр" as DSP
-participant "API Gateway" as GW
-participant "Сервис ставок" as Bidding
-participant "Кеш (Redis)" as Cache
-participant "Сервис выдачи" as Delivery
-participant "Сервис статистики" as Stats
-queue "Очередь событий (Kafka)" as Kafka
+title C4 Component Diagram — внутреннее устройство Сервиса ставок
 
-== Синхронный путь (бюджет P95 ≤ 80 мс) ==
+Container_Ext(gateway, "API Gateway", "Managed API Gateway", "Маршрутизирует bid-запросы")
 
-DSP -> GW: POST /rtb/bid (OpenRTB BidRequest)
-activate GW
+Container_Boundary(bidding, "Сервис ставок") {
+    Component(apiLayer, "API Layer", "gRPC server", "Принимает EvaluateBid, валидирует BidContext, применяет дедлайн запроса")
+    Component(candidateSelector, "Candidate Selector", "модуль", "Отбирает кандидатов среди кампаний по условиям таргетинга")
+    Component(auctionLogic, "Auction Logic", "модуль", "Взвешивает ставки кандидатов по бизнес-правилам, выбирает победителя")
+    Component(cacheClient, "Cache Client", "модуль", "Redis-клиент; оборачивает вызовы Circuit Breaker'ом")
+    Component(deliveryClient, "Delivery Client", "модуль", "gRPC-клиент к Сервису выдачи; оборачивает вызовы Circuit Breaker'ом")
+    Component(fallbackStore, "Fallback Snapshot", "in-memory", "Последний валидный локальный снимок ставок и дефолтные консервативные ставки на случай отказа Кеша")
+    Component(campaignClient, "Campaign Client", "gRPC-клиент", "Bulk-запрос GetActiveCampaigns при старте инстанса")
+    Component(cacheUpdater, "Cache Updater", "Kafka consumer", "Потребляет campaign.updated / campaign.budget.updated / campaign.activated, обновляет Кеш")
+}
 
-GW -> GW: аутентификация (mTLS), rate limit (token bucket)
-GW -> GW: Circuit Breaker: цепь к Сервису ставок закрыта — продолжаем
+ContainerDb_Ext(cache, "Кеш", "Redis Cluster", "Горячие данные для взвешивания ставок")
+Container_Ext(campaignService, "Сервис кампаний", "gRPC-сервис", "Источник истины по конфигурации кампаний и бюджетам ")
+Container_Ext(kafka, "Kafka", "Брокер событий", "campaign.updated / campaign.budget.updated / campaign.activated")
+Container_Ext(delivery, "Сервис выдачи", "Node.js", "Формирует HTML/JS-разметку баннера")
 
-GW -> Bidding: EvaluateBid(BidContext) [gRPC]
-activate Bidding
+Rel(gateway, apiLayer, "EvaluateBid(BidContext)", "gRPC")
+Rel(apiLayer, candidateSelector, "передаёт контекст показа")
+Rel(candidateSelector, cacheClient, "запрашивает targeting_index, campaign:{id}")
+Rel(cacheClient, cache, "GET", "Redis protocol")
+Rel(cacheClient, fallbackStore, "при отказе Кеша — читает снимок")
+Rel(candidateSelector, auctionLogic, "передаёт список кандидатов")
+Rel(auctionLogic, deliveryClient, "запрашивает разметку для победителя")
+Rel(deliveryClient, delivery, "RenderCreative(campaign_id)", "gRPC")
+Rel(auctionLogic, apiLayer, "возвращает BidDecision")
 
-alt Кеш доступен (основной путь)
-    Bidding -> Cache: GET targeting_index:{geo}:{device}
-    activate Cache
-    Cache --> Bidding: campaign_id[] (кандидаты)
-    Bidding -> Cache: GET campaign:{id}, budget_remaining:{id}
-    Cache --> Bidding: конфигурация кампаний, остаток бюджета
-    deactivate Cache
-    Bidding -> Bidding: взвешивание ставок, выбор победителя
+Rel(campaignClient, campaignService, "GetActiveCampaigns(...)", "gRPC, только при старте инстанса")
+Rel(campaignClient, cache, "первичная (bulk) загрузка campaign:{id}, targeting_index")
+Rel(campaignClient, fallbackStore, "инициализирует локальный снимок")
 
-    Bidding -> Delivery: RenderCreative(campaign_id) [gRPC]
-    activate Delivery
-    Delivery --> Bidding: creative markup (adm)
-    deactivate Delivery
-
-else Кеш недоступен / Circuit Breaker открыт
-    Bidding -> Cache: GET targeting_index:{geo}:{device}
-    activate Cache
-    Cache --> Bidding: timeout / error
-    deactivate Cache
-    Bidding -> Bidding: Circuit Breaker → open,\nfallback: последняя валидная\nставка из локального snapshot\nили дефолтная консервативная ставка
-end
-
-Bidding --> GW: BidDecision (has_bid, price, creative_ref)
-deactivate Bidding
-
-GW --> DSP: 200 OK (OpenRTB BidResponse)\nили 204 No Content
-deactivate GW
-
-== Асинхронный путь (вне бюджета SLA, не блокирует ответ DSP-партнёру) ==
-
-Delivery ->> Stats: событие показа (async, fire-and-forget)
-activate Stats
-Stats ->> Kafka: publish ad.impressions {event_id, campaign_id, ...}
-deactivate Stats
-
-Kafka -->> Kafka: доставка независимым consumer-группам\n(Сервис аналитики, Финансовый сервис,\nХранилище событий)
-
-note over Kafka
-  Идемпотентность: Финансовый сервис
-  дедуплицирует по event_id перед
-  списанием средств (см. interaction.md)
-end note
+Rel(campaignService, kafka, "публикует campaign.updated / campaign.budget.updated / campaign.activated")
+Rel(kafka, cacheUpdater, "потребляет события", "Kafka consumer")
+Rel(cacheUpdater, cache, "инкрементально обновляет campaign:{id}, targeting_index, budget_remaining")
+Rel(cacheUpdater, fallbackStore, "обновляет локальный снимок")
 
 @enduml
